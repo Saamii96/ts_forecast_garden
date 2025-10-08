@@ -2,25 +2,27 @@ from datasetsforecast.m5 import M5
 import pandas as pd
 import logging
 from pathlib import Path
+import os
+import numpy as np
+import sys
+sys.path.append('./../')
+
+from datasets.utils import reduce_mem_usage, get_memory_usage, sizeof_fmt, merge_by_concat
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def load_m5_dataset() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+TARGET = 'sales'
+END_TRAIN = 1913
+MAIN_INDEX = ['id','d']
+
+
+def load_m5_dataset(data_dir: str):
     """
     Load M5 dataset using datasetsforecast library from Nixtla.
-    
-    Returns:
-        tuple: (Y_df, X_df, S_df) containing target series, exogenous variables, and static data
-    """
-    # Get the project root directory (one level up from datasets folder)
-    project_root = Path(__file__).parent.parent
-    data_dir = project_root / 'data'
-    
-    # Ensure the data directory exists
-    data_dir.mkdir(exist_ok=True)
-    
+    """    
     logger.info(f"Loading M5 dataset to: {data_dir}")
     Y_df, X_df, S_df = M5.load(directory=str(data_dir))
     
@@ -32,10 +34,102 @@ def load_m5_dataset() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     logger.info("First few rows of target series:")
     print(Y_df.head())
     
-    return Y_df, X_df, S_df
+
+
+def create_m5_grid_1(data_dir: str) -> pd.DataFrame:
+    """
+    Create M5 grid 1.
+
+    Args:
+        data_dir: the directory to save the grid
+
+    Returns:
+        pd.DataFrame: the grid
+    """
+
+    train_df = pd.read_csv(os.path.join(data_dir, 'm5/datasets/sales_train_validation.csv'))
+    train_df['id'] = train_df.item_id + '_' + train_df.store_id + '_validation'
+
+    prices_df = pd.read_csv(os.path.join(data_dir, 'm5/datasets/sell_prices.csv'))
+
+    calendar_df = pd.read_csv(os.path.join(data_dir, 'm5/datasets/calendar.csv'))
+    calendar_df['d'] = np.arange(calendar_df.shape[0]) + 1
+    calendar_df['d'] = 'd_' + calendar_df['d'].astype('str')
+    calendar_df['d'] = calendar_df['d'].astype('category')
+
+    logger.info('Create Grid')
+
+    index_columns = ['id','item_id','dept_id','cat_id','store_id','state_id']
+    grid_df = pd.melt(train_df, 
+                    id_vars = index_columns, 
+                    var_name = 'd', 
+                    value_name = TARGET)
+
+    logger.info(f'Train rows: {len(train_df)}, {len(grid_df)}')
+
+    add_grid = pd.DataFrame()
+    for i in range(1, 29):
+        temp_df = train_df[index_columns]
+        temp_df = temp_df.drop_duplicates()
+        temp_df['d'] = 'd_'+ str(END_TRAIN+i)
+        temp_df[TARGET] = np.nan
+        add_grid = pd.concat([add_grid,temp_df])
+
+    grid_df = pd.concat([grid_df,add_grid])
+    grid_df = grid_df.reset_index(drop=True)
+    del temp_df, add_grid, train_df
+
+    logger.info(f'Original grid_df: {sizeof_fmt(grid_df.memory_usage(index=True).sum())}')
+
+    for col in index_columns:
+        grid_df[col] = grid_df[col].astype('category')
+
+    logger.info(f'Reduced grid_df: {sizeof_fmt(grid_df.memory_usage(index=True).sum())}')
+
+
+    logger.info('Release week')
+    release_df = prices_df.groupby(['store_id','item_id'])['wm_yr_wk'].agg(['min']).reset_index()
+    release_df.columns = ['store_id','item_id','release']
+
+    grid_df = merge_by_concat(grid_df, release_df, ['store_id','item_id'])
+    del release_df
+
+    grid_df = merge_by_concat(grid_df, calendar_df[['wm_yr_wk','d']], ['d'])
+    grid_df = grid_df[grid_df['wm_yr_wk']>=grid_df['release']]
+    grid_df = grid_df.reset_index(drop=True)
+
+    logger.info(f'Original grid_df: {sizeof_fmt(grid_df.memory_usage(index=True).sum())}')
+
+    grid_df['release'] = grid_df['release'] - grid_df['release'].min()
+    grid_df['release'] = grid_df['release'].astype(np.int16)
+
+    logger.info(f'Reduced grid_df: {sizeof_fmt(grid_df.memory_usage(index=True).sum())}')
+
+    logger.info('Save Part 1')
+    grid_df.to_pickle(os.path.join(data_dir, 'm5/processed/grid_part_1.pkl'))
+    logger.info('Size:', grid_df.shape)
+
+    return grid_df
+
+
 
 
 if __name__ == "__main__":
+
     logger.info("Loading M5 dataset...")
-    Y_df, X_df, S_df = load_m5_dataset()
+
+    # Get the project root directory (one level up from datasets folder)
+    project_root = Path(__file__).parent.parent
+    data_dir = project_root / 'data'
+
+    # Ensure the data directory exists
+    data_dir.mkdir(exist_ok=True)
+
+    # Check if the dataset is already loaded
+    if any(Path(os.path.join(data_dir, 'm5/datasets/')).iterdir()) == False:
+        load_m5_dataset(data_dir)
+    
     logger.info("M5 dataset loaded successfully!")
+
+    # Create and save processed data
+    # create_m5_grid_1(data_dir)
